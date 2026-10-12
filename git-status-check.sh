@@ -10,9 +10,14 @@
 # dei progetti gestiti, partendo da origin/<branch_base>. Dopo il push chiede
 # se impostarlo come branch di default del repository su GitHub (richiede gh).
 #
+# Modalità --build-push: esegue ./build_push_docker.sh <TAG> <production|testing>
+# dentro la cartella di ogni progetto che contiene lo script (o solo in quello
+# indicato con -p). Chiede conferma prima di avviare build e push.
+#
 # Uso:
 #   ./git-status-check.sh [directory_base]
 #   ./git-status-check.sh --new-branch [-p progetto] [-b nuovo_branch] [-f branch_base] [-D] [-y] [directory_base]
+#   ./git-status-check.sh --build-push <TAG> <production|testing> [-p progetto] [-y] [directory_base]
 # Se directory_base non è specificata, usa la cartella dove si trova lo script.
 # I valori non passati in --new-branch vengono chiesti interattivamente.
 # =============================================================================
@@ -46,6 +51,12 @@ Uso:
       -D, --set-default     imposta il nuovo branch come default del repo su GitHub
                             (senza -D viene chiesto; con -y senza -D non viene impostato)
       -y, --yes             non chiedere conferma prima di creare e pushare
+
+  $(basename "$0") --build-push <TAG> <production|testing> [opzioni] [directory_base]
+      Esegue ./build_push_docker.sh <TAG> <ambiente> nella cartella di ogni progetto
+      che contiene lo script.
+      -p, --project NOME    esegue solo sul progetto indicato
+      -y, --yes             non chiedere conferma prima di avviare build e push
   -h, --help              mostra questo aiuto
 EOF
 }
@@ -64,11 +75,16 @@ NB_BRANCH=""
 NB_BASE=""
 NB_YES=false
 NB_SET_DEFAULT=false
+BP_TAG=""
+BP_ENV=""
 POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n|--new-branch) MODE="new-branch"; shift ;;
+        -B|--build-push)
+            require_arg "$1" "${2:-}"; require_arg "$1" "${3:-}"
+            MODE="build-push"; BP_TAG="$2"; BP_ENV="$3"; shift 3 ;;
         -p|--project)    require_arg "$1" "${2:-}"; NB_PROJECT="$2"; shift 2 ;;
         -b|--branch)     require_arg "$1" "${2:-}"; NB_BRANCH="$2"; shift 2 ;;
         -f|--from)       require_arg "$1" "${2:-}"; NB_BASE="$2"; shift 2 ;;
@@ -85,8 +101,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$MODE" == "check" && ( -n "$NB_PROJECT" || -n "$NB_BRANCH" || -n "$NB_BASE" || "$NB_YES" == true || "$NB_SET_DEFAULT" == true ) ]]; then
-    echo -e "${RED}Errore: -p/-b/-f/-D/-y si usano solo con --new-branch.${RESET}" >&2
+    echo -e "${RED}Errore: -p/-b/-f/-D/-y si usano solo con --new-branch o --build-push.${RESET}" >&2
     exit 2
+fi
+
+if [[ "$MODE" == "build-push" ]]; then
+    if [[ -n "$NB_BRANCH" || -n "$NB_BASE" || "$NB_SET_DEFAULT" == true ]]; then
+        echo -e "${RED}Errore: -b/-f/-D si usano solo con --new-branch.${RESET}" >&2
+        exit 2
+    fi
+    if [[ "$BP_ENV" != "production" && "$BP_ENV" != "testing" ]]; then
+        echo -e "${RED}Errore: ambiente '$BP_ENV' non valido (production|testing).${RESET}" >&2
+        exit 2
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -473,6 +500,76 @@ create_branch_flow() {
 
 if [[ "$MODE" == "new-branch" ]]; then
     create_branch_flow
+fi
+
+# ---------------------------------------------------------------------------
+# Modalità --build-push: ./build_push_docker.sh <TAG> <ambiente> su ogni progetto
+# ---------------------------------------------------------------------------
+BUILD_SCRIPT="build_push_docker.sh"
+
+build_push_flow() {
+    local targets=() dir name reply
+    local ok=() failed=() skipped=()
+
+    for dir in "${NUPSI_DIRS[@]}"; do
+        name="${dir#"$BASE_DIR"/}"
+        if [[ -n "$NB_PROJECT" && "$NB_PROJECT" != "$name" && "$NB_PROJECT" != "$(basename "$name")" ]]; then
+            continue
+        fi
+        if [[ -x "$dir/$BUILD_SCRIPT" ]]; then
+            targets+=("$name")
+        else
+            skipped+=("$name")
+        fi
+    done
+
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        if [[ -n "$NB_PROJECT" ]]; then
+            nb_fail "nessun ./$BUILD_SCRIPT eseguibile per il progetto '$NB_PROJECT'."
+        fi
+        nb_fail "nessun progetto con ./$BUILD_SCRIPT eseguibile in $BASE_DIR."
+    fi
+
+    echo ""
+    echo -e "${BOLD}${CYAN}Build & push Docker${RESET} — tag ${BOLD}${BP_TAG}${RESET}, ambiente ${BOLD}${BP_ENV}${RESET}"
+    echo -e "${BOLD}Progetti:${RESET}"
+    printf "  - %s\n" "${targets[@]}"
+    if [[ ${#skipped[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}Senza ./$BUILD_SCRIPT (saltati):${RESET}"
+        printf "  - %s\n" "${skipped[@]}"
+    fi
+    echo ""
+
+    if [[ "$NB_YES" != true ]]; then
+        nb_require_tty "-y per confermare"
+        reply=""
+        read -r -p "Avviare build e push sui ${#targets[@]} progetti? [s/N]: " reply || reply=""
+        [[ "${reply,,}" == "s" ]] || { echo "Operazione annullata."; exit 0; }
+    fi
+
+    for name in "${targets[@]}"; do
+        echo ""
+        echo -e "${BOLD}${CYAN}==> ${name}${RESET}: ./$BUILD_SCRIPT ${BP_TAG} ${BP_ENV}"
+        if (cd "$BASE_DIR/$name" && "./$BUILD_SCRIPT" "$BP_TAG" "$BP_ENV"); then
+            ok+=("$name")
+            echo -e "    ${GREEN}OK${RESET}"
+        else
+            failed+=("$name")
+            echo -e "    ${RED}FALLITO${RESET}"
+        fi
+    done
+
+    echo ""
+    echo -e "${BOLD}Riepilogo build & push:${RESET}  ${GREEN}${#ok[@]} ok${RESET}  |  ${RED}${#failed[@]} falliti${RESET}"
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        printf "  ${RED}- %s${RESET}\n" "${failed[@]}"
+        exit 1
+    fi
+    exit 0
+}
+
+if [[ "$MODE" == "build-push" ]]; then
+    build_push_flow
 fi
 
 # ---------------------------------------------------------------------------

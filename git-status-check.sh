@@ -6,11 +6,12 @@
 # Al termine propone di aggiornare (solo git pull) i repo indietro rispetto al remote.
 #
 # Modalità --new-branch: crea un nuovo branch locale e remoto (origin) su uno
-# dei progetti gestiti, partendo da origin/<branch_base>.
+# dei progetti gestiti, partendo da origin/<branch_base>. Dopo il push chiede
+# se impostarlo come branch di default del repository su GitHub (richiede gh).
 #
 # Uso:
 #   ./git-status-check.sh [directory_base]
-#   ./git-status-check.sh --new-branch [-p progetto] [-b nuovo_branch] [-f branch_base] [-y] [directory_base]
+#   ./git-status-check.sh --new-branch [-p progetto] [-b nuovo_branch] [-f branch_base] [-D] [-y] [directory_base]
 # Se directory_base non è specificata, usa la cartella dove si trova lo script.
 # I valori non passati in --new-branch vengono chiesti interattivamente.
 # =============================================================================
@@ -41,6 +42,8 @@ Uso:
       -p, --project NOME    progetto (es. NUPSI-CDN-cache o NUPSI-FE/NUPSI-FE-MAPLIBRE)
       -b, --branch NOME     nome del nuovo branch
       -f, --from NOME       branch di partenza su origin (default: branch corrente)
+      -D, --set-default     imposta il nuovo branch come default del repo su GitHub
+                            (senza -D viene chiesto; con -y senza -D non viene impostato)
       -y, --yes             non chiedere conferma prima di creare e pushare
   -h, --help              mostra questo aiuto
 EOF
@@ -59,6 +62,7 @@ NB_PROJECT=""
 NB_BRANCH=""
 NB_BASE=""
 NB_YES=false
+NB_SET_DEFAULT=false
 POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
@@ -67,6 +71,7 @@ while [[ $# -gt 0 ]]; do
         -p|--project)    require_arg "$1" "${2:-}"; NB_PROJECT="$2"; shift 2 ;;
         -b|--branch)     require_arg "$1" "${2:-}"; NB_BRANCH="$2"; shift 2 ;;
         -f|--from)       require_arg "$1" "${2:-}"; NB_BASE="$2"; shift 2 ;;
+        -D|--set-default) NB_SET_DEFAULT=true; shift ;;
         -y|--yes)        NB_YES=true; shift ;;
         -h|--help)       usage; exit 0 ;;
         -*)
@@ -78,8 +83,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$MODE" == "check" && ( -n "$NB_PROJECT" || -n "$NB_BRANCH" || -n "$NB_BASE" || "$NB_YES" == true ) ]]; then
-    echo -e "${RED}Errore: -p/-b/-f/-y si usano solo con --new-branch.${RESET}" >&2
+if [[ "$MODE" == "check" && ( -n "$NB_PROJECT" || -n "$NB_BRANCH" || -n "$NB_BASE" || "$NB_YES" == true || "$NB_SET_DEFAULT" == true ) ]]; then
+    echo -e "${RED}Errore: -p/-b/-f/-D/-y si usano solo con --new-branch.${RESET}" >&2
     exit 2
 fi
 
@@ -342,6 +347,48 @@ nb_confirm() {
     [[ "${answer,,}" == "s" ]]
 }
 
+# Ricava "owner/repo" dall'URL di origin (solo GitHub; ignora eventuali credenziali nell'URL)
+nb_github_slug() {
+    local url
+    url=$(git -C "$1" remote get-url origin 2>/dev/null) || return 1
+    [[ "$url" =~ github\.com[:/]([^/]+)/([^/]+)$ ]] || return 1
+    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]%.git}"
+}
+
+# Chiede (o applica con -D) l'impostazione del nuovo branch come default su GitHub
+nb_set_default_branch() {
+    local repo="$1" slug current answer
+    if [[ "$NB_SET_DEFAULT" != true ]]; then
+        # Con -y senza -D, o senza terminale, non si cambia il default del remote
+        [[ "$NB_YES" == true || ! -t 0 ]] && return 0
+    fi
+
+    if ! slug=$(nb_github_slug "$repo"); then
+        echo -e "${YELLOW}Origin non è un repository GitHub: branch di default non modificato.${RESET}" >&2
+        return 0
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+        echo -e "${YELLOW}gh non installato: branch di default non modificato.${RESET}" >&2
+        return 0
+    fi
+
+    current=$(gh repo view "$slug" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || echo "?")
+
+    if [[ "$NB_SET_DEFAULT" != true ]]; then
+        echo ""
+        read -r -p "Impostare '${NB_BRANCH}' come branch di default di ${slug} su GitHub (attuale: ${current})? [s/N]: " answer || answer=""
+        [[ "${answer,,}" == "s" ]] || { echo "  Branch di default invariato (${current})."; return 0; }
+    fi
+
+    echo -e "  ${CYAN}gh repo edit ${slug} --default-branch ${NB_BRANCH}${RESET}"
+    if ! gh repo edit "$slug" --default-branch "$NB_BRANCH" >/dev/null; then
+        echo -e "${RED}Impostazione del branch di default fallita (servono permessi admin sul repo).${RESET}" >&2
+        echo -e "Per riprovare: gh repo edit \"$slug\" --default-branch \"$NB_BRANCH\"" >&2
+        return 1
+    fi
+    echo -e "  ${GREEN}Branch di default di ${slug}: ${current} → ${NB_BRANCH}${RESET}"
+}
+
 create_branch_flow() {
     local repo base_ref base_info ahead dirty
 
@@ -372,6 +419,7 @@ create_branch_flow() {
     echo -e "  Progetto:      ${BOLD}${NB_PROJECT}${RESET}"
     echo -e "  Nuovo branch:  ${BOLD}${NB_BRANCH}${RESET} (locale + origin/${NB_BRANCH})"
     echo -e "  Parte da:      ${BOLD}${base_ref}${RESET} → ${base_info:0:70}"
+    [[ "$NB_SET_DEFAULT" == true ]] && echo -e "  Default remote: ${BOLD}sì${RESET} (diventerà il branch di default su GitHub)"
 
     # Commit locali del branch base non ancora su origin: non finiranno nel nuovo branch
     if git -C "$repo" rev-parse --verify --quiet "refs/heads/$NB_BASE" >/dev/null; then
@@ -400,10 +448,13 @@ create_branch_flow() {
         exit 1
     fi
 
+    local default_rc=0
+    nb_set_default_branch "$repo" || default_rc=1
+
     echo ""
     echo -e "${GREEN}Branch '${NB_BRANCH}' creato su ${NB_PROJECT} (locale + origin) e attivo.${RESET}"
     echo ""
-    exit 0
+    exit "$default_rc"
 }
 
 if [[ "$MODE" == "new-branch" ]]; then

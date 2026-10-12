@@ -2,6 +2,7 @@
 # =============================================================================
 # git-status-check.sh
 # Controlla se i repository locali NUPSI-* sono allineati con il remote.
+# Le cartelle contenitore (es. NUPSI-FE) vengono espanse nei loro figli.
 # Uso: ./git-status-check.sh [directory_base]
 # Se directory_base non è specificata, usa la cartella dove si trova lo script.
 # =============================================================================
@@ -38,13 +39,16 @@ declare -a REPO_STATUSES=()
 declare -a REPO_DETAILS=()
 declare -a REPO_LAST_COMMITS=()
 
+# Cartelle contenitore: non sono repository, ma contengono repository figli
+CONTAINER_DIRS=("NUPSI-FE")
+
 # ---------------------------------------------------------------------------
 # Funzione: analizza un singolo repository
 # ---------------------------------------------------------------------------
 check_repo() {
     local repo_path="$1"
     local repo_name
-    repo_name="$(basename "$repo_path")"
+    repo_name="${repo_path#"$BASE_DIR"/}"
 
     # Verifica presenza di .git
     if [[ ! -d "$repo_path/.git" ]]; then
@@ -158,7 +162,25 @@ echo -e "${BOLD}${CYAN}  Directory base: $BASE_DIR${RESET}"
 echo -e "${BOLD}${CYAN}================================================================${RESET}"
 echo ""
 
-mapfile -t NUPSI_DIRS < <(find "$BASE_DIR" -maxdepth 1 -type d -name "NUPSI-*" | sort)
+is_container() {
+    local name="$1" c
+    for c in "${CONTAINER_DIRS[@]}"; do
+        [[ "$name" == "$c" ]] && return 0
+    done
+    return 1
+}
+
+NUPSI_DIRS=()
+while IFS= read -r dir; do
+    if is_container "$(basename "$dir")"; then
+        # Espande la cartella contenitore nei suoi figli diretti
+        while IFS= read -r child; do
+            NUPSI_DIRS+=("$child")
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d | sort)
+    else
+        NUPSI_DIRS+=("$dir")
+    fi
+done < <(find "$BASE_DIR" -maxdepth 1 -type d -name "NUPSI-*" | sort)
 
 if [[ ${#NUPSI_DIRS[@]} -eq 0 ]]; then
     echo -e "${YELLOW}Nessuna cartella NUPSI-* trovata in $BASE_DIR${RESET}"
@@ -168,7 +190,7 @@ fi
 echo -e "Trovati ${BOLD}${#NUPSI_DIRS[@]}${RESET} repository. Avvio controllo...\n"
 
 for dir in "${NUPSI_DIRS[@]}"; do
-    repo_name="$(basename "$dir")"
+    repo_name="${dir#"$BASE_DIR"/}"
     echo -ne "  Controllo ${CYAN}${repo_name}${RESET}..."
     check_repo "$dir"
     status="${REPO_STATUSES[-1]}"

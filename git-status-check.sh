@@ -3,7 +3,8 @@
 # git-status-check.sh
 # Controlla se i repository locali NUPSI-* sono allineati con il remote.
 # Le cartelle contenitore (es. NUPSI-FE) vengono espanse nei loro figli.
-# Al termine propone di aggiornare (solo git pull) i repo indietro rispetto al remote.
+# Al termine propone di aggiornare (solo git pull) i repo indietro rispetto al remote
+# e, per i repo con modifiche locali o avanti, di committare le modifiche pendenti e fare git push.
 #
 # Modalità --new-branch: crea un nuovo branch locale e remoto (origin) su uno
 # dei progetti gestiti, partendo da origin/<branch_base>. Dopo il push chiede
@@ -181,11 +182,20 @@ check_repo() {
         return
     fi
 
+    # Modifiche non committate nel working tree
+    local dirty_count
+    dirty_count=$(git -C "$repo_path" status --porcelain 2>/dev/null | wc -l)
+
     if [[ "$local_sha" == "$remote_sha" ]]; then
         REPO_NAMES+=("$repo_name")
         REPO_BRANCHES+=("$branch")
-        REPO_STATUSES+=("AGGIORNATO")
-        REPO_DETAILS+=("In linea con $upstream")
+        if [[ "$dirty_count" -gt 0 ]]; then
+            REPO_STATUSES+=("MODIFICHE LOCALI")
+            REPO_DETAILS+=("In linea con $upstream ma con ${dirty_count} file modificati non committati")
+        else
+            REPO_STATUSES+=("AGGIORNATO")
+            REPO_DETAILS+=("In linea con $upstream")
+        fi
         REPO_LAST_COMMITS+=("$last_commit")
         return
     fi
@@ -210,7 +220,11 @@ check_repo() {
         REPO_NAMES+=("$repo_name")
         REPO_BRANCHES+=("$branch")
         REPO_STATUSES+=("DA PUSHARE")
-        REPO_DETAILS+=("Avanti di ${ahead} commit rispetto a $upstream — eseguire: git push")
+        if [[ "$dirty_count" -gt 0 ]]; then
+            REPO_DETAILS+=("Avanti di ${ahead} commit rispetto a $upstream (+${dirty_count} file non committati) — eseguire: git push")
+        else
+            REPO_DETAILS+=("Avanti di ${ahead} commit rispetto a $upstream — eseguire: git push")
+        fi
         REPO_LAST_COMMITS+=("$last_commit")
     else
         # Fallback (non dovrebbe accadere)
@@ -486,7 +500,7 @@ for dir in "${NUPSI_DIRS[@]}"; do
     case "$status" in
         "AGGIORNATO")    echo -e " ${GREEN}${status}${RESET}" ;;
         "DA AGGIORNARE") echo -e " ${RED}${status}${RESET}" ;;
-        "DA PUSHARE")    echo -e " ${YELLOW}${status}${RESET}" ;;
+        "DA PUSHARE"|"MODIFICHE LOCALI") echo -e " ${YELLOW}${status}${RESET}" ;;
         "DIVERGED")      echo -e " ${RED}${status}${RESET}" ;;
         *)               echo -e " ${YELLOW}${status}${RESET}" ;;
     esac
@@ -521,7 +535,7 @@ for i in "${!REPO_NAMES[@]}"; do
             printf "${RED}%-35s %-32s %-47s %-18s${RESET}\n" "$name" "$branch" "$last_commit" "$status"
             count_warn=$(( count_warn + 1 ))
             ;;
-        "DA PUSHARE")
+        "DA PUSHARE"|"MODIFICHE LOCALI")
             printf "${YELLOW}%-35s %-32s %-47s %-18s${RESET}\n" "$name" "$branch" "$last_commit" "$status"
             count_warn=$(( count_warn + 1 ))
             ;;
@@ -597,6 +611,81 @@ if [[ ${#to_pull[@]} -gt 0 ]]; then
         else
             echo "Nessun pull eseguito."
         fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Repo con modifiche locali o avanti rispetto al remote: commit opzionale + push
+# ---------------------------------------------------------------------------
+
+# Chiede se committare le modifiche non committate del repo (git add -A + commit)
+commit_pending_changes() {
+    local repo="$1" name="$2" dirty reply msg
+    dirty=$(git -C "$repo" status --porcelain 2>/dev/null || echo "")
+    [[ -n "$dirty" ]] || return 0
+
+    echo -e "    ${YELLOW}Modifiche non committate:${RESET}"
+    git -C "$repo" status --short | sed 's/^/      /'
+    reply=""
+    read -r -p "  Committare queste modifiche su ${name}? [s/N]: " reply || reply=""
+    [[ "${reply,,}" == "s" ]] || { echo "    commit saltato"; return 0; }
+
+    msg=""
+    while [[ -z "$msg" ]]; do
+        read -r -p "  Messaggio di commit: " msg || return 1
+    done
+    echo -e "  ${CYAN}git add -A && git commit${RESET} → ${BOLD}${name}${RESET}"
+    if git -C "$repo" add -A && git -C "$repo" commit --quiet -m "$msg"; then
+        echo -e "    ${GREEN}Commit creato${RESET}"
+    else
+        echo -e "    ${RED}git commit fallito${RESET}"
+        return 1
+    fi
+}
+
+to_push=()
+for i in "${!REPO_NAMES[@]}"; do
+    case "${REPO_STATUSES[$i]}" in
+        "DA PUSHARE"|"MODIFICHE LOCALI") to_push+=("$i") ;;
+    esac
+done
+
+if [[ ${#to_push[@]} -gt 0 ]]; then
+    echo ""
+    if [[ ! -t 0 ]]; then
+        echo -e "${YELLOW}Input non interattivo: commit/push non eseguiti.${RESET}"
+    else
+        echo -e "${BOLD}Repository con modifiche locali o avanti rispetto al remote:${RESET}"
+        for i in "${to_push[@]}"; do
+            name="${REPO_NAMES[$i]}"
+            repo="$BASE_DIR/$name"
+            echo ""
+            if [[ "${REPO_STATUSES[$i]}" == "DA PUSHARE" ]]; then
+                echo -e "  ${BOLD}${name}${RESET} [${REPO_BRANCHES[$i]}] — commit non pushati:"
+                git -C "$repo" log --format="      %h %s" "@{upstream}..HEAD" 2>/dev/null | head -n 10
+            else
+                echo -e "  ${BOLD}${name}${RESET} [${REPO_BRANCHES[$i]}]"
+            fi
+
+            commit_pending_changes "$repo" "$name" || continue
+
+            # Nessun commit da pushare (es. commit saltato su repo solo con modifiche locali)
+            ahead=$(git -C "$repo" rev-list --count "@{upstream}..HEAD" 2>/dev/null || echo "0")
+            [[ "$ahead" -gt 0 ]] || continue
+
+            reply=""
+            read -r -p "  Eseguire git push su ${name}? [s/N]: " reply || reply=""
+            [[ "${reply,,}" == "s" ]] || { echo "    push saltato"; continue; }
+
+            echo -e "  ${CYAN}git push${RESET} → ${BOLD}${name}${RESET}"
+            if git -C "$repo" push --quiet; then
+                REPO_STATUSES[$i]="AGGIORNATO"
+                count_warn=$(( count_warn - 1 ))
+                echo -e "    ${GREEN}OK${RESET}"
+            else
+                echo -e "    ${RED}git push fallito${RESET}"
+            fi
+        done
     fi
 fi
 

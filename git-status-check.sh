@@ -12,14 +12,15 @@
 #
 # Modalità --build-push: esegue ./build_push_docker.sh <TAG> <production|testing>
 # dentro la cartella di ogni progetto che contiene lo script (o solo in quello
-# indicato con -p). Chiede conferma prima di avviare build e push.
+# indicato con -p). Tag, ambiente e progetti non passati vengono chiesti
+# interattivamente; chiede conferma prima di avviare build e push.
 #
 # Uso:
 #   ./git-status-check.sh [directory_base]
 #   ./git-status-check.sh --new-branch [-p progetto] [-b nuovo_branch] [-f branch_base] [-D] [-y] [directory_base]
-#   ./git-status-check.sh --build-push <TAG> <production|testing> [-p progetto] [-y] [directory_base]
+#   ./git-status-check.sh --build-push [-t tag] [-e production|testing] [-p progetto] [-y] [directory_base]
 # Se directory_base non è specificata, usa la cartella dove si trova lo script.
-# I valori non passati in --new-branch vengono chiesti interattivamente.
+# I valori non passati in --new-branch e --build-push vengono chiesti interattivamente.
 # =============================================================================
 
 set -euo pipefail
@@ -52,10 +53,13 @@ Uso:
                             (senza -D viene chiesto; con -y senza -D non viene impostato)
       -y, --yes             non chiedere conferma prima di creare e pushare
 
-  $(basename "$0") --build-push <TAG> <production|testing> [opzioni] [directory_base]
+  $(basename "$0") --build-push [opzioni] [directory_base]
       Esegue ./build_push_docker.sh <TAG> <ambiente> nella cartella di ogni progetto
-      che contiene lo script.
+      che contiene lo script. I valori non passati vengono chiesti interattivamente.
+      -t, --tag TAG         tag/immagine passato come primo argomento allo script
+      -e, --env AMBIENTE    production | testing
       -p, --project NOME    esegue solo sul progetto indicato
+                            (senza -p viene chiesto; con -y senza -p usa tutti i progetti)
       -y, --yes             non chiedere conferma prima di avviare build e push
   -h, --help              mostra questo aiuto
 EOF
@@ -82,9 +86,9 @@ POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n|--new-branch) MODE="new-branch"; shift ;;
-        -B|--build-push)
-            require_arg "$1" "${2:-}"; require_arg "$1" "${3:-}"
-            MODE="build-push"; BP_TAG="$2"; BP_ENV="$3"; shift 3 ;;
+        -B|--build-push) MODE="build-push"; shift ;;
+        -t|--tag)        require_arg "$1" "${2:-}"; BP_TAG="$2"; shift 2 ;;
+        -e|--env)        require_arg "$1" "${2:-}"; BP_ENV="$2"; shift 2 ;;
         -p|--project)    require_arg "$1" "${2:-}"; NB_PROJECT="$2"; shift 2 ;;
         -b|--branch)     require_arg "$1" "${2:-}"; NB_BRANCH="$2"; shift 2 ;;
         -f|--from)       require_arg "$1" "${2:-}"; NB_BASE="$2"; shift 2 ;;
@@ -105,12 +109,17 @@ if [[ "$MODE" == "check" && ( -n "$NB_PROJECT" || -n "$NB_BRANCH" || -n "$NB_BAS
     exit 2
 fi
 
+if [[ "$MODE" != "build-push" && ( -n "$BP_TAG" || -n "$BP_ENV" ) ]]; then
+    echo -e "${RED}Errore: -t/-e si usano solo con --build-push.${RESET}" >&2
+    exit 2
+fi
+
 if [[ "$MODE" == "build-push" ]]; then
     if [[ -n "$NB_BRANCH" || -n "$NB_BASE" || "$NB_SET_DEFAULT" == true ]]; then
         echo -e "${RED}Errore: -b/-f/-D si usano solo con --new-branch.${RESET}" >&2
         exit 2
     fi
-    if [[ "$BP_ENV" != "production" && "$BP_ENV" != "testing" ]]; then
+    if [[ -n "$BP_ENV" && "$BP_ENV" != "production" && "$BP_ENV" != "testing" ]]; then
         echo -e "${RED}Errore: ambiente '$BP_ENV' non valido (production|testing).${RESET}" >&2
         exit 2
     fi
@@ -507,47 +516,98 @@ fi
 # ---------------------------------------------------------------------------
 BUILD_SCRIPT="build_push_docker.sh"
 
-build_push_flow() {
-    local targets=() dir name reply
-    local ok=() failed=() skipped=()
+BP_ALL="Tutti i progetti"
+BP_ENVS=("production" "testing")
 
+# Profondità massima di ricerca di ./build_push_docker.sh dentro ogni progetto
+BP_SEARCH_DEPTH=3
+
+# Elenca (relative a BASE_DIR) le cartelle dei progetti che contengono
+# ./build_push_docker.sh eseguibile, anche in sottocartelle (es. NUPSI-STAC-server-live/uploads)
+bp_list_available() {
+    local dir script
     for dir in "${NUPSI_DIRS[@]}"; do
-        name="${dir#"$BASE_DIR"/}"
-        if [[ -n "$NB_PROJECT" && "$NB_PROJECT" != "$name" && "$NB_PROJECT" != "$(basename "$name")" ]]; then
-            continue
-        fi
-        if [[ -x "$dir/$BUILD_SCRIPT" ]]; then
-            targets+=("$name")
-        else
-            skipped+=("$name")
-        fi
-    done
+        while IFS= read -r script; do
+            [[ -x "$script" ]] && echo "${script%/"$BUILD_SCRIPT"}"
+        done < <(find "$dir" -maxdepth "$BP_SEARCH_DEPTH" \( -name node_modules -o -name .git \) -prune \
+                    -o -type f -name "$BUILD_SCRIPT" -print 2>/dev/null | sort)
+    done | sed "s|^$BASE_DIR/||"
+}
 
-    if [[ ${#targets[@]} -eq 0 ]]; then
-        if [[ -n "$NB_PROJECT" ]]; then
-            nb_fail "nessun ./$BUILD_SCRIPT eseguibile per il progetto '$NB_PROJECT'."
-        fi
-        nb_fail "nessun progetto con ./$BUILD_SCRIPT eseguibile in $BASE_DIR."
+# Sceglie i progetti: da -p, tutti con -y, altrimenti da menu (tutti o uno)
+bp_select_targets() {
+    local available=() name choice
+    mapfile -t available < <(bp_list_available)
+    [[ ${#available[@]} -gt 0 ]] || nb_fail "nessun progetto con ./$BUILD_SCRIPT eseguibile in $BASE_DIR."
+
+    if [[ -n "$NB_PROJECT" ]]; then
+        # -p accetta il percorso relativo, il nome della cartella o il progetto padre
+        BP_TARGETS=()
+        for name in "${available[@]}"; do
+            if [[ "$NB_PROJECT" == "$name" || "$NB_PROJECT" == "$(basename "$name")" || "$name" == "$NB_PROJECT"/* ]]; then
+                BP_TARGETS+=("$name")
+            fi
+        done
+        [[ ${#BP_TARGETS[@]} -gt 0 ]] \
+            || nb_fail "nessun ./$BUILD_SCRIPT eseguibile per il progetto '$NB_PROJECT'. Disponibili: ${available[*]}"
+        return
     fi
+
+    if [[ "$NB_YES" == true || ! -t 0 ]]; then
+        BP_TARGETS=("${available[@]}")
+        return
+    fi
+
+    echo -e "${BOLD}Progetti con ./$BUILD_SCRIPT:${RESET}"
+    choice=$(choose_from_list "Scegli il progetto [numero]: " "$BP_ALL" "${available[@]}") \
+        || nb_fail "nessun progetto scelto."
+    if [[ "$choice" == "$BP_ALL" ]]; then
+        BP_TARGETS=("${available[@]}")
+    else
+        BP_TARGETS=("$choice")
+    fi
+}
+
+# Chiede il tag se non passato con -t (invio = BP_DEFAULT_TAG)
+BP_DEFAULT_TAG="none"
+bp_select_tag() {
+    local answer=""
+    [[ -n "$BP_TAG" ]] && return
+    nb_require_tty "-t tag"
+    read -r -p "Tag (primo argomento di ./$BUILD_SCRIPT) [${BP_DEFAULT_TAG}]: " answer || answer=""
+    BP_TAG="${answer:-$BP_DEFAULT_TAG}"
+}
+
+# Chiede l'ambiente se non passato con -e
+bp_select_env() {
+    [[ -n "$BP_ENV" ]] && return
+    nb_require_tty "-e production|testing"
+    echo -e "${BOLD}Ambiente:${RESET}"
+    BP_ENV=$(choose_from_list "Scegli l'ambiente [numero]: " "${BP_ENVS[@]}") \
+        || nb_fail "nessun ambiente scelto."
+}
+
+build_push_flow() {
+    local name ok=() failed=()
+    BP_TARGETS=()
 
     echo ""
-    echo -e "${BOLD}${CYAN}Build & push Docker${RESET} — tag ${BOLD}${BP_TAG}${RESET}, ambiente ${BOLD}${BP_ENV}${RESET}"
-    echo -e "${BOLD}Progetti:${RESET}"
-    printf "  - %s\n" "${targets[@]}"
-    if [[ ${#skipped[@]} -gt 0 ]]; then
-        echo -e "${YELLOW}Senza ./$BUILD_SCRIPT (saltati):${RESET}"
-        printf "  - %s\n" "${skipped[@]}"
-    fi
+    echo -e "${BOLD}${CYAN}Build & push Docker${RESET} — directory base: $BASE_DIR"
     echo ""
+    bp_select_targets
+    bp_select_tag
+    bp_select_env
 
-    if [[ "$NB_YES" != true ]]; then
-        nb_require_tty "-y per confermare"
-        reply=""
-        read -r -p "Avviare build e push sui ${#targets[@]} progetti? [s/N]: " reply || reply=""
-        [[ "${reply,,}" == "s" ]] || { echo "Operazione annullata."; exit 0; }
-    fi
+    echo ""
+    echo -e "${BOLD}Riepilogo:${RESET}"
+    echo -e "  Tag:        ${BOLD}${BP_TAG}${RESET}"
+    echo -e "  Ambiente:   ${BOLD}${BP_ENV}${RESET}"
+    echo -e "  Progetti:"
+    printf "    - %s\n" "${BP_TARGETS[@]}"
+    echo ""
+    nb_confirm "Avviare build e push su ${#BP_TARGETS[@]} progetto/i?" || { echo "Operazione annullata."; exit 0; }
 
-    for name in "${targets[@]}"; do
+    for name in "${BP_TARGETS[@]}"; do
         echo ""
         echo -e "${BOLD}${CYAN}==> ${name}${RESET}: ./$BUILD_SCRIPT ${BP_TAG} ${BP_ENV}"
         if (cd "$BASE_DIR/$name" && "./$BUILD_SCRIPT" "$BP_TAG" "$BP_ENV"); then

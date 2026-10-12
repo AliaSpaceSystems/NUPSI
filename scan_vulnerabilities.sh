@@ -2,22 +2,99 @@
 
 # =============================================================================
 # NUPSI - Vulnerability Assessment Report (Trivy + Grype)
-# Images: aliaspace/nupsi-* v1.1.0
+# Images: aliaspace/nupsi-*:<tag>
+#
+# Uso: ./scan_vulnerabilities.sh [-p progetto] [-t tag] [tag]
+#   -p, --project NOME  controlla solo l'immagine indicata (es. nupsi-api)
+#   -t, --tag TAG       tag delle immagini (in alternativa come argomento posizionale)
+# I valori non passati vengono chiesti interattivamente: progetto da menu
+# (tutti o uno), tag con invio = DEFAULT_VERSION.
 # =============================================================================
 
-VERSION="1.1.0"
+DEFAULT_VERSION="1.1.0"
+IMAGE_PREFIX="aliaspace"
+PROJECTS=(
+    "nupsi-stac"
+    "nupsi-fe"
+    "nupsi-api"
+    "nupsi-geojsonserver"
+    "nupsi-persistence"
+    "nupsi-cdncache"
+    "nupsi-stac-live"
+)
+ALL_PROJECTS="Tutti i progetti"
+# Formato tag Docker: [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}
+TAG_REGEX='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
+
+usage() {
+    echo "Uso: $(basename "$0") [-p progetto] [-t tag] [tag]"
+    echo "Progetti: ${PROJECTS[*]}"
+}
+
+fail() {
+    echo "Errore: $1" >&2
+    exit 2
+}
+
+# ---------- argomenti ----------
+VERSION=""
+PROJECT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--project) [ -n "${2:-}" ] || fail "l'opzione $1 richiede un valore."; PROJECT="$2"; shift 2 ;;
+        -t|--tag)     [ -n "${2:-}" ] || fail "l'opzione $1 richiede un valore."; VERSION="$2"; shift 2 ;;
+        -h|--help)    usage; exit 0 ;;
+        -*)           usage >&2; fail "opzione sconosciuta '$1'." ;;
+        *)            [ -z "$VERSION" ] || fail "tag specificato due volte."; VERSION="$1"; shift ;;
+    esac
+done
+
+# ---------- progetto: da -p, da menu (tutti o uno), tutti se non interattivo ----------
+SELECTED=()
+if [ -n "$PROJECT" ]; then
+    for name in "${PROJECTS[@]}"; do
+        [ "$name" == "$PROJECT" ] && SELECTED=("$name")
+    done
+    [ ${#SELECTED[@]} -gt 0 ] || fail "progetto '$PROJECT' non trovato. Disponibili: ${PROJECTS[*]}"
+elif [ -t 0 ]; then
+    echo "Progetti da controllare:"
+    options=("$ALL_PROJECTS" "${PROJECTS[@]}")
+    for i in "${!options[@]}"; do
+        printf "  %2d) %s\n" $(( i + 1 )) "${options[$i]}"
+    done
+    while true; do
+        read -r -p "Scegli il progetto [numero, invio = 1]: " choice || fail "nessun progetto scelto."
+        choice="${choice:-1}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
+            break
+        fi
+        echo "Scelta non valida."
+    done
+    if [ "$choice" -eq 1 ]; then
+        SELECTED=("${PROJECTS[@]}")
+    else
+        SELECTED=("${options[$(( choice - 1 ))]}")
+    fi
+else
+    SELECTED=("${PROJECTS[@]}")
+fi
+
+# ---------- tag ----------
+if [ -z "$VERSION" ]; then
+    if [ -t 0 ]; then
+        read -r -p "Tag delle immagini da controllare [${DEFAULT_VERSION}]: " VERSION || VERSION=""
+    fi
+    VERSION="${VERSION:-$DEFAULT_VERSION}"
+fi
+[[ "$VERSION" =~ $TAG_REGEX ]] || fail "tag '$VERSION' non valido."
+
 REPORT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
 REPORT_FILE="vulnerability_report_$(date '+%Y%m%d_%H%M%S').txt"
 
-IMAGES=(
-    "aliaspace/nupsi-stac:${VERSION}"
-    "aliaspace/nupsi-fe:${VERSION}"
-    "aliaspace/nupsi-api:${VERSION}"
-    "aliaspace/nupsi-geojsonserver:${VERSION}"
-    "aliaspace/nupsi-persistence:${VERSION}"
-    "aliaspace/nupsi-cdncache:${VERSION}"
-    "aliaspace/nupsi-stac-live:${VERSION}"
-)
+IMAGES=()
+for name in "${SELECTED[@]}"; do
+    IMAGES+=("${IMAGE_PREFIX}/${name}:${VERSION}")
+done
 
 # Per-image counters
 declare -A TRIVY_CRITICAL

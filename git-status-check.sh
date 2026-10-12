@@ -3,6 +3,7 @@
 # git-status-check.sh
 # Controlla se i repository locali NUPSI-* sono allineati con il remote.
 # Le cartelle contenitore (es. NUPSI-FE) vengono espanse nei loro figli.
+# Al termine propone di aggiornare (solo git pull) i repo indietro rispetto al remote.
 # Uso: ./git-status-check.sh [directory_base]
 # Se directory_base non è specificata, usa la cartella dove si trova lo script.
 # =============================================================================
@@ -261,6 +262,54 @@ if [[ ${#needs_action[@]} -gt 0 ]]; then
         echo -e "  ${BOLD}${REPO_NAMES[$i]}${RESET} [${REPO_BRANCHES[$i]}]"
         echo -e "    → ${REPO_DETAILS[$i]}"
     done
+fi
+
+# ---------------------------------------------------------------------------
+# Aggiornamento interattivo: solo git pull sui repo DA AGGIORNARE
+# ---------------------------------------------------------------------------
+to_pull=()
+for i in "${!REPO_NAMES[@]}"; do
+    [[ "${REPO_STATUSES[$i]}" == "DA AGGIORNARE" ]] && to_pull+=("$i")
+done
+
+if [[ ${#to_pull[@]} -gt 0 ]]; then
+    echo ""
+    if [[ ! -t 0 ]]; then
+        echo -e "${YELLOW}Input non interattivo: pull non eseguito.${RESET}"
+    else
+        echo -e "${BOLD}Repository da aggiornare (git pull):${RESET}"
+        for i in "${to_pull[@]}"; do
+            echo -e "  - ${REPO_NAMES[$i]} [${REPO_BRANCHES[$i]}]"
+        done
+        answer=""
+        read -r -p "Eseguire git pull? [t]utti / [s]celta singola / [N]o: " answer || answer=""
+        case "${answer,,}" in
+            t|tutti) mode="all" ;;
+            s|scelta) mode="ask" ;;
+            *) mode="none" ;;
+        esac
+
+        if [[ "$mode" != "none" ]]; then
+            for i in "${to_pull[@]}"; do
+                name="${REPO_NAMES[$i]}"
+                if [[ "$mode" == "ask" ]]; then
+                    reply=""
+                    read -r -p "  git pull su ${name}? [s/N]: " reply || reply=""
+                    [[ "${reply,,}" == "s" ]] || { echo "    saltato"; continue; }
+                fi
+                echo -e "  ${CYAN}git pull${RESET} → ${BOLD}${name}${RESET}"
+                if git -C "$BASE_DIR/$name" pull --ff-only; then
+                    REPO_STATUSES[$i]="AGGIORNATO"
+                    count_warn=$(( count_warn - 1 ))
+                    echo -e "    ${GREEN}OK${RESET}"
+                else
+                    echo -e "    ${RED}git pull fallito${RESET}"
+                fi
+            done
+        else
+            echo "Nessun pull eseguito."
+        fi
+    fi
 fi
 
 echo ""

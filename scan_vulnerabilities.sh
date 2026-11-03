@@ -88,6 +88,28 @@ if [ -z "$VERSION" ]; then
 fi
 [[ "$VERSION" =~ $TAG_REGEX ]] || fail "tag '$VERSION' non valido."
 
+# ---------- tool e database vulnerabilità ----------
+# I DB vengono aggiornati una sola volta qui: un DB scaduto non deve mai
+# produrre un report "pulito". Le scansioni poi non riscaricano nulla.
+for tool in trivy grype; do
+    command -v "$tool" >/dev/null 2>&1 || fail "'$tool' non trovato nel PATH."
+done
+echo "Aggiornamento DB Trivy..."
+trivy image --download-db-only --no-progress >/dev/null || fail "aggiornamento DB Trivy fallito."
+# /tmp è tmpfs: la migrazione SQLite del DB Grype (>3 GB) lo satura
+# ("database or disk is full") e ogni tentativo fallito lascia una
+# directory grype-db-download* da ~1.5 GB nella cache.
+GRYPE_DB_DIR="${GRYPE_DB_CACHE_DIR:-$HOME/.cache/grype/db}"
+export GRYPE_TMPDIR="${GRYPE_TMPDIR:-$HOME/.cache/grype-tmp}"
+mkdir -p "$GRYPE_TMPDIR" || fail "impossibile creare '$GRYPE_TMPDIR'."
+rm -rf "$GRYPE_DB_DIR"/grype-db-download*
+echo "Aggiornamento DB Grype..."
+TMPDIR="$GRYPE_TMPDIR" grype db update >/dev/null || fail "aggiornamento DB Grype fallito."
+export GRYPE_DB_AUTO_UPDATE=false
+
+SCAN_ERR_FILE=$(mktemp) || fail "impossibile creare un file temporaneo."
+trap 'rm -f "$SCAN_ERR_FILE"' EXIT
+
 REPORT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
 REPORT_FILE="vulnerability_report_$(date '+%Y%m%d_%H%M%S').txt"
 
@@ -106,6 +128,7 @@ TOTAL_TRIVY_CRITICAL=0
 TOTAL_TRIVY_HIGH=0
 TOTAL_GRYPE_CRITICAL=0
 TOTAL_GRYPE_HIGH=0
+SCAN_ERRORS=0
 
 separator() {
     printf '%0.s=' {1..80}
@@ -129,6 +152,15 @@ print_header() {
     echo
 }
 
+# Segnala una scansione fallita: i contatori diventano ERR invece di 0,
+# così un errore non passa per "nessuna vulnerabilità".
+report_scan_error() {
+    local tool="$1" rc="$2"
+    printf "  [ERR] %s scan failed (exit code %s):\n" "$tool" "$rc"
+    grep -E "ERROR|FATAL|error" "$SCAN_ERR_FILE" | tail -5 | sed 's/^/    /'
+    SCAN_ERRORS=$((SCAN_ERRORS + 1))
+}
+
 scan_image() {
     local image="$1"
     local short_name="${image%%:*}"
@@ -144,44 +176,65 @@ scan_image() {
     printf "  [TRIVY]\n"
     thin_separator
 
-    trivy image --clear-cache 2>/dev/null
-
-    local trivy_output
-    trivy_output=$(trivy image \
+    local trivy_raw trivy_rc trivy_output
+    trivy_raw=$(trivy image \
         --severity CRITICAL,HIGH \
         --format table \
         --no-progress \
-        "$image" 2>/dev/null | awk '
+        --skip-db-update \
+        "$image" 2>"$SCAN_ERR_FILE")
+    trivy_rc=$?
+
+    if [ "$trivy_rc" -ne 0 ]; then
+        report_scan_error "Trivy" "$trivy_rc"
+        TRIVY_CRITICAL["$short_name"]="ERR"
+        TRIVY_HIGH["$short_name"]="ERR"
+    else
+        trivy_output=$(echo "$trivy_raw" | awk '
             /^Report Summary/ { skip=1; next }
             skip && /^└/      { skip=0; next }
             skip              { next }
                               { print }
         ')
 
-    if [ -n "$trivy_output" ]; then
-        echo "$trivy_output"
-    else
-        printf "  No CRITICAL/HIGH vulnerabilities found by Trivy.\n"
+        if [ -n "$trivy_output" ]; then
+            echo "$trivy_output"
+        else
+            printf "  No CRITICAL/HIGH vulnerabilities found by Trivy.\n"
+        fi
+
+        # Trivy unisce le celle SEVERITY uguali: si contano le righe
+        # "Total: N (HIGH: x, CRITICAL: y)" di ogni target, non le righe tabella
+        local t_critical t_high
+        t_critical=$(echo "$trivy_output" | grep -oE "CRITICAL: [0-9]+" | awk '{ s += $2 } END { print s + 0 }')
+        t_high=$(echo "$trivy_output"     | grep -oE "HIGH: [0-9]+"     | awk '{ s += $2 } END { print s + 0 }')
+        t_critical=${t_critical//[^0-9]/}; t_critical=${t_critical:-0}
+        t_high=${t_high//[^0-9]/};         t_high=${t_high:-0}
+
+        TRIVY_CRITICAL["$short_name"]=$t_critical
+        TRIVY_HIGH["$short_name"]=$t_high
+        TOTAL_TRIVY_CRITICAL=$((TOTAL_TRIVY_CRITICAL + t_critical))
+        TOTAL_TRIVY_HIGH=$((TOTAL_TRIVY_HIGH + t_high))
     fi
-
-    local t_critical t_high
-    t_critical=$(echo "$trivy_output" | grep -c "| CRITICAL" 2>/dev/null; true)
-    t_high=$(echo "$trivy_output"     | grep -c "| HIGH"     2>/dev/null; true)
-    t_critical=${t_critical//[^0-9]/}; t_critical=${t_critical:-0}
-    t_high=${t_high//[^0-9]/};         t_high=${t_high:-0}
-
-    TRIVY_CRITICAL["$short_name"]=$t_critical
-    TRIVY_HIGH["$short_name"]=$t_high
-    TOTAL_TRIVY_CRITICAL=$((TOTAL_TRIVY_CRITICAL + t_critical))
-    TOTAL_TRIVY_HIGH=$((TOTAL_TRIVY_HIGH + t_high))
 
     # --- GRYPE ---
     echo
     printf "  [GRYPE]\n"
     thin_separator
 
-    local grype_output
-    grype_output=$(grype "$image" -o table 2>/dev/null | grep -E "Critical|High" || true)
+    local grype_raw grype_rc grype_output
+    grype_raw=$(TMPDIR="$GRYPE_TMPDIR" grype "$image" -o table 2>"$SCAN_ERR_FILE")
+    grype_rc=$?
+
+    if [ "$grype_rc" -ne 0 ]; then
+        report_scan_error "Grype" "$grype_rc"
+        GRYPE_CRITICAL["$short_name"]="ERR"
+        GRYPE_HIGH["$short_name"]="ERR"
+        return
+    fi
+
+    # Match sulla colonna SEVERITY, non su "high" ovunque nella riga
+    grype_output=$(echo "$grype_raw" | grep -E "[[:space:]](Critical|High)[[:space:]]" || true)
 
     if [ -n "$grype_output" ]; then
         echo "$grype_output"
@@ -190,8 +243,8 @@ scan_image() {
     fi
 
     local g_critical g_high
-    g_critical=$(echo "$grype_output" | grep -ic "critical" 2>/dev/null; true)
-    g_high=$(echo "$grype_output"     | grep -ic "high"     2>/dev/null; true)
+    g_critical=$(echo "$grype_output" | grep -cE "[[:space:]]Critical[[:space:]]"; true)
+    g_high=$(echo "$grype_output"     | grep -cE "[[:space:]]High[[:space:]]";     true)
     g_critical=${g_critical//[^0-9]/}; g_critical=${g_critical:-0}
     g_high=${g_high//[^0-9]/};         g_high=${g_high:-0}
 
@@ -231,14 +284,17 @@ print_summary() {
     local total_critical=$(( TOTAL_TRIVY_CRITICAL > TOTAL_GRYPE_CRITICAL ? TOTAL_TRIVY_CRITICAL : TOTAL_GRYPE_CRITICAL ))
     local total_high=$(( TOTAL_TRIVY_HIGH > TOTAL_GRYPE_HIGH ? TOTAL_TRIVY_HIGH : TOTAL_GRYPE_HIGH ))
 
+    if [ "$SCAN_ERRORS" -gt 0 ]; then
+        printf "  [ERR] %s scan(s) failed — results are INCOMPLETE, see ERR above.\n" "$SCAN_ERRORS"
+    fi
     if [ "$total_critical" -gt 0 ]; then
         printf "  [!] CRITICAL vulnerabilities found — IMMEDIATE remediation required.\n"
-    else
+    elif [ "$SCAN_ERRORS" -eq 0 ]; then
         printf "  [OK] No CRITICAL vulnerabilities found.\n"
     fi
     if [ "$total_high" -gt 0 ]; then
         printf "  [!] HIGH vulnerabilities found — prompt attention required.\n"
-    else
+    elif [ "$SCAN_ERRORS" -eq 0 ]; then
         printf "  [OK] No HIGH vulnerabilities found.\n"
     fi
     echo
@@ -259,6 +315,9 @@ print_summary() {
 
     print_summary
 
+    [ "$SCAN_ERRORS" -eq 0 ]
 } | tee "$REPORT_FILE"
+SCAN_RC=${PIPESTATUS[0]}
 
 echo "Report saved to: $REPORT_FILE"
+exit "$SCAN_RC"
